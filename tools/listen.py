@@ -2,8 +2,9 @@ import audioop
 import time
 import sounddevice
 import numpy
+import struct
 
-stream = sounddevice.RawOutputStream(samplerate=12000, channels = 1, dtype='int16', latency = 0.1)
+stream = sounddevice.RawOutputStream(samplerate=12500, channels = 1, dtype='int16')
 
 from socket import *
 s=socket(AF_INET, SOCK_DGRAM)
@@ -16,6 +17,13 @@ send_t = time.time()
 
 outfile = open('data', 'w')
 outfile2 = open('data.bin', 'wb')
+
+sine = numpy.round(numpy.sin(numpy.arange(0, numpy.pi*2*20, numpy.pi*2*20/1000)) * 0) # 16384)
+sine_lin = b''
+for i in range(len(sine)):
+    sine_lin += struct.pack("<h", int(sine[i]))
+sine_alaw = audioop.lin2alaw(sine_lin, 2)
+sine_packet = '\x00' * 8 + sine_alaw
 
 stream_started = False
 
@@ -33,6 +41,9 @@ while True:
     if m and len(m[0]) > 0:
         t = time.time()
         print '%0.3f' % (t - start), m[1], len(m[0])
+        
+        s.sendto(sine_packet, m[1])
+        
         start = t
         m = audioop.alaw2lin(m[0][8:], 2)
         for i in range(len(m) / 2):

@@ -1,18 +1,29 @@
 #include "audio_task.h"
 #include "fast_adc.h"
 #include "alaw.h"
+#include "sigma_delta.h"
 #include <espressif/esp_common.h>
 #include <esp/gpio.h>
+#include <esp/i2s_regs.h>
+#include <i2s_dma/i2s_dma.h>
 #include <lwip/pbuf.h>
 #include <lwip/udp.h>
 #include <lwip/ip_addr.h>
 #include <FreeRTOS.h>
 #include <task.h>
 #include <queue.h>
+#include <esplibs/libphy.h>
 
 // 20 milliseconds of audio per packet
 #define AUDIO_HDRLEN 8
-#define AUDIO_BLOCKSIZE 240
+#define AUDIO_BLOCKSIZE 1000
+#define AUDIO_SAMPLERATE 12500
+
+// I2S output is run at 1024x the audio samplerate and
+// sigma-delta algorithm is used to convert the PCM samples to 1-bit stream.
+#define I2S_WORDRATE 200000
+#define I2S_BITRATE (I2S_WORDRATE * 32)
+#define AUDIO_OUT_OVERSAMPLE (I2S_WORDRATE/AUDIO_SAMPLERATE)
 
 #define UDP_PORT 18294
 
@@ -20,6 +31,8 @@ typedef struct {
   uint16_t peer_port;
   ip_addr_t peer_addr;
   QueueHandle_t received_bufs;
+  struct pbuf *current_buf;
+  int current_buf_use_count;
   TickType_t last_seen;
 } peer_t;
 
@@ -49,6 +62,20 @@ static struct {
   int samplecount;
 } g_audioin;
 
+static struct {
+  // Received buffers that have been processed and can now be freed.
+  QueueHandle_t free_bufs;
+  
+  // Current position in input buffers in g_peers.
+  int current_pos;
+  
+  // Previous DAC value, for interpolation
+  int dac_prev;
+  
+  // Error accumulator for sigma-delta
+  int error_acc;
+} g_audioout;
+
 static void audio_init()
 {
   g_audioin.adc_bias = 4096;
@@ -56,18 +83,16 @@ static void audio_init()
   g_audioin.free_bufs = xQueueCreate(4, sizeof(struct pbuf*));
   g_audioin.filled_bufs = xQueueCreate(4, sizeof(struct pbuf*));
   
+  g_audioout.free_bufs = xQueueCreate(MAX_PEERS * 2, sizeof(struct pbuf*));
+  
   for (int i = 0; i < MAX_PEERS; i++)
   {
     g_peers[i].received_bufs = xQueueCreate(4, sizeof(struct pbuf*));
   }
 }
 
-static void IRAM audio_irq(void *arg)
+static inline IRAM void process_audio_in(portBASE_TYPE *task_awoken)
 {
-  portBASE_TYPE task_awoken = pdFALSE;
-  
-  gpio_write(12, 1); // For debugging, IRQ processing start
-  
   g_audioin.samplecount++;
   
   // Read the results of previous ADC sampling and start a new sampling immediately.
@@ -88,12 +113,14 @@ static void IRAM audio_irq(void *arg)
   uint8_t companded = alaw_encode(ac_value + g_audioin.quant_acc);
   g_audioin.quant_acc += ac_value - alaw_decode(companded);
   
+  // Take new buffers from g_audioin.free_bufs
   if (!g_audioin.current_buf)
   {
-    xQueueReceiveFromISR(g_audioin.free_bufs, &g_audioin.current_buf, &task_awoken);
+    xQueueReceiveFromISR(g_audioin.free_bufs, &g_audioin.current_buf, task_awoken);
     g_audioin.bytes_written = 0;
   }
   
+  // Post filled buffers to g_audioin.filled_bufs
   if (g_audioin.current_buf)
   {
     uint8_t *payload_ptr = (uint8_t*)g_audioin.current_buf->payload;
@@ -102,12 +129,91 @@ static void IRAM audio_irq(void *arg)
     
     if (g_audioin.bytes_written >= AUDIO_BLOCKSIZE)
     {
-      xQueueSendToBackFromISR(g_audioin.filled_bufs, &g_audioin.current_buf, &task_awoken);
+      xQueueSendToBackFromISR(g_audioin.filled_bufs, &g_audioin.current_buf, task_awoken);
       g_audioin.current_buf = NULL;
     }
   }
+}
+
+static inline IRAM void process_audio_out(portBASE_TYPE *task_awoken)
+{
+  if (g_audioout.current_pos == 0)
+  {
+    // Start of new buffer block, check for new packets of each peer.
+    for (int i = 0; i < MAX_PEERS; i++)
+    {
+      struct pbuf *new_buf = NULL;
+      if (xQueueReceiveFromISR(g_peers[i].received_bufs, &new_buf, task_awoken) == pdTRUE)
+      {
+        // Ok, received new packet, schedule the old one to be freed
+        if (g_peers[i].current_buf)
+        {
+          xQueueSendToBackFromISR(g_audioout.free_bufs, &g_peers[i].current_buf, task_awoken);
+        }
+        
+        g_peers[i].current_buf = new_buf;
+        g_peers[i].current_buf_use_count = 0;
+      }
+      else if (g_peers[i].current_buf)
+      {
+        // No packet found, repeat the last one for a few blocks and then silence this peer.
+        g_peers[i].current_buf_use_count++;
+        if (g_peers[i].current_buf_use_count > 4)
+        {
+          xQueueSendToBackFromISR(g_audioout.free_bufs, &g_peers[i].current_buf, task_awoken);
+          g_peers[i].current_buf = NULL;
+        }
+      }
+    }
+  }
   
-  gpio_write(12, 0);
+  // Calculate sum of values for all active peers.
+  int dac_val = 0;
+  for (int i = 0; i < MAX_PEERS; i++)
+  {
+    if (g_peers[i].current_buf)
+    {
+      uint8_t sample = ((uint8_t*)g_peers[i].current_buf->payload)[AUDIO_HDRLEN + g_audioout.current_pos];
+      int expanded = alaw_decode(sample);
+      dac_val += expanded;
+    }
+  }
+  
+  // Clamp to range 0 to 8192.
+  dac_val += 4096;
+  if (dac_val < 0) dac_val = 0;
+  if (dac_val > 8191) dac_val = 8191;
+  
+  // Perform sigma-delta modulation
+  // Data is written directly to I2S TXFIFO.
+  // It has 128 words deep fifo in hardware, so there is no need to use DMA here.
+  {
+    sigma_delta_encode(g_audioout.dac_prev, dac_val, &I2S.TXFIFO, AUDIO_OUT_OVERSAMPLE, &g_audioout.error_acc);
+    g_audioout.dac_prev = dac_val;
+  }
+  
+  g_audioout.current_pos++;
+  if (g_audioout.current_pos >= AUDIO_BLOCKSIZE)
+  {
+    g_audioout.current_pos = 0;
+  }
+}
+
+// #define REG sdk_tx_pwctrl_pk_num
+// static uint32_t g_foo;
+
+static void IRAM audio_irq(void *arg)
+{
+  portBASE_TYPE task_awoken = pdFALSE;
+  
+  gpio_write(13, 1); // For debugging, IRQ processing start
+
+  process_audio_in(&task_awoken);
+  process_audio_out(&task_awoken);
+  
+  gpio_write(13, 0);
+  
+//   gpio_write(13, REG == g_foo);
   portEND_SWITCHING_ISR(task_awoken);
 }
 
@@ -133,9 +239,9 @@ static void remove_old_peers()
 
 static void handle_packet(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
-  if (ip_addr_cmp(pcb->local_ip, addr))
+  if (ip_addr_cmp(&pcb->local_ip, addr))
   {
-    // Our own broadcast packet..
+    // Our own broadcast packet came back to us for some reason.
     pbuf_free(p);
     return;
   }
@@ -169,9 +275,17 @@ static void handle_packet(void *arg, struct udp_pcb *pcb, struct pbuf *p, const 
   if (peer_idx >= 0)
   {
     g_peers[peer_idx].last_seen = xTaskGetTickCount();
-    if (p->len > 0 && xQueueSendToBack(g_peers[peer_idx].received_bufs, &p, 0) == pdTRUE)
+    
+    // The input buffer has associated ESP SDK buffer that we want
+    // to free rather soon. Not sure if there is a better way to do
+    // it, but this makes a full copy of the buffer to be queued.
+    if (p->len == AUDIO_HDRLEN + AUDIO_BLOCKSIZE)
     {
-      return;
+      struct pbuf *p2 = pbuf_clone(PBUF_TRANSPORT, PBUF_RAM, p);
+      if (xQueueSendToBack(g_peers[peer_idx].received_bufs, &p2, 0) != pdTRUE)
+      {
+        pbuf_free(p2);
+      }
     }
   }
   
@@ -192,19 +306,27 @@ void audio_task(void *pvParameters)
   gpio_enable(12, GPIO_OUTPUT);
   gpio_enable(13, GPIO_OUTPUT);
   
-  // Enable interrupt handler at 12 kHz
+  // Enable interrupt handler at 12.5 kHz
   adc_enable();
   _xt_isr_attach(INUM_TIMER_FRC1, audio_irq, NULL);
-  timer_set_frequency(FRC1, 12000);
+  timer_set_frequency(FRC1, AUDIO_SAMPLERATE);
   timer_set_interrupts(FRC1, true);
   timer_set_run(FRC1, true);
+  
+  // Enable I2S for audio output
+  {
+    i2s_clock_div_t div = i2s_get_clock_div(I2S_BITRATE);
+    i2s_pins_t i2s_pins = {.data = true};
+    i2s_dma_init(NULL, NULL, div, i2s_pins);
+    SET_MASK_BITS(I2S.CONF, I2S_CONF_TX_START);
+  }
   
   // Open UDP broadcast port
   LOCK_TCPIP_CORE();
   struct udp_pcb *pcb;
   pcb = udp_new();
   udp_bind(pcb, IP_ADDR_ANY, UDP_PORT);
-  ip_set_option(pcb, SOF_BROADCAST);
+  //ip_set_option(pcb, SOF_BROADCAST);
   udp_recv(pcb, handle_packet, NULL);
   UNLOCK_TCPIP_CORE();
   
@@ -231,11 +353,18 @@ void audio_task(void *pvParameters)
       xQueueSendToBack(g_audioin.free_bufs, &p, 0);
     }
     
+    while (uxQueueMessagesWaiting(g_audioout.free_bufs))
+    {
+      struct pbuf *p = NULL;
+      xQueueReceive(g_audioout.free_bufs, &p, 0);
+      pbuf_free(p);
+    }
+    
     {
       struct pbuf *p = NULL;
       if (xQueueReceive(g_audioin.filled_bufs, &p, 1) == pdTRUE)
       {
-        gpio_write(13, 1);
+//         gpio_write(13, 1);
         
         p->len = p->tot_len = AUDIO_HDRLEN + AUDIO_BLOCKSIZE;
         
@@ -268,16 +397,22 @@ void audio_task(void *pvParameters)
         
         pbuf_free(p);
         
-        printf("ADC val %d bias %d peers %d\n", g_audioin.adc_prev, g_audioin.adc_bias / 256,
+        printf("ADC val %d bias %d DAC %d pos %d queue %d %d peers %d\n", g_audioin.adc_prev, g_audioin.adc_bias / 256, g_audioout.dac_prev,
+               g_audioout.current_pos, (int)uxQueueMessagesWaiting(g_peers[0].received_bufs), !!g_peers[0].current_buf,
               peer_count);
         
-        gpio_write(13, 0);
+//         printf("%02x\n", REG);
+//         g_foo = REG;
+        
+//         gpio_write(13, 0);
       }
     }
   }
 }
 
+uint32_t sdk_readvdd33();
+
 void audio_task_start()
 {
-  xTaskCreate(audio_task, "audio", 256, NULL, 2, NULL);
+  xTaskCreate(audio_task, "audio", 512, NULL, 2, NULL);
 }

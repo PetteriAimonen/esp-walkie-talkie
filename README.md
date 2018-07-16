@@ -13,6 +13,17 @@ Files
 * **sigma_delta.c:** Sigma-delta modulation for audio playback
 * **user_main.c:** Startup logic, volume control and wifi passwords.
 
+Building
+--------
+
+To build the firmware, you need https://github.com/SuperHouse/esp-open-rtos and https://github.com/pfalcon/esp-open-sdk/ installed.
+
+Make sure that esp-open-sdk is in your PATH environment variable.
+
+If needed, edit ESP_OPEN_RTOS_DIR in Makefile.
+
+Then just type `make` to build or `make flash` to also program the ESP8266.
+
 Connections
 -----------
 

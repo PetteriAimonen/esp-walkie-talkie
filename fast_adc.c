@@ -20,8 +20,8 @@ void adc_enable()
   // Inform the vendor libs that ADC is in use
   *tout_dis_txpwr_track = 1;
   
-  // ADC clock speed is 3 MHz, /8/8 means one set of 8 SAR samples takes about 2 us.
-  uint32_t clk_div = 8;
+  // ADC clock speed is 3 MHz, /16/8 means one set of 8 SAR samples takes about 42 us.
+  uint32_t clk_div = 16;
   uint32_t win_cnt = 8;
   *SAR_CFG = (*SAR_CFG & 0xFFFF00E3) | ((win_cnt-1) << 2) | (clk_div << 8);
   *SAR_TIM1 = (*SAR_TIM1 & 0xFF000000) | (clk_div * 5 + ((clk_div - 1) << 16) + ((clk_div - 1) << 8) - 1);

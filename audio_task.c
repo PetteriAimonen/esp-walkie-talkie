@@ -16,7 +16,7 @@
 
 // 20 milliseconds of audio per packet
 #define AUDIO_HDRLEN 8
-#define AUDIO_BLOCKSIZE 1000
+#define AUDIO_BLOCKSIZE 500
 #define AUDIO_SAMPLERATE 12500
 
 // I2S output is run at 1024x the audio samplerate and
@@ -24,6 +24,12 @@
 #define I2S_WORDRATE 200000
 #define I2S_BITRATE (I2S_WORDRATE * 32)
 #define AUDIO_OUT_OVERSAMPLE (I2S_WORDRATE/AUDIO_SAMPLERATE)
+
+#define ECHO_CANCEL_LEN 12
+#define DAC_HISTORY_LEN 16
+#define DAC_HISTORY_MASK 15
+#define CLICK_REMOVE_LEN 32
+#define CLICK_REMOVE_MASK 31
 
 #define UDP_PORT 18294
 
@@ -60,6 +66,13 @@ static struct {
   int quant_acc;
   
   int samplecount;
+  
+  // Echo cancellation filter
+  int echo_cancel[ECHO_CANCEL_LEN];
+  
+  // Click removal filter
+  int click_remove[CLICK_REMOVE_LEN];
+  uint8_t click_remove_idx;
 } g_audioin;
 
 static struct {
@@ -74,7 +87,13 @@ static struct {
   
   // Error accumulator for sigma-delta
   int error_acc;
+  
+  // Previous DAC values, for echo cancellation
+  int history[DAC_HISTORY_LEN];
+  uint8_t history_idx;
 } g_audioout;
+
+int get_volume();
 
 static void audio_init()
 {
@@ -105,13 +124,61 @@ static inline IRAM void process_audio_in(portBASE_TYPE *task_awoken)
   g_audioin.adc_prev = raw_adc;
   
   // Estimate the DC level of the signal using a 50 Hz low-pass filter.
-  int bias = g_audioin.adc_bias / 256;
+  int bias = g_audioin.adc_bias / 1024;
   int ac_value = filtered - bias;
   g_audioin.adc_bias += ac_value;
   
+  // Perform echo cancellation
+  int echo_estimated = 0;
+  for (int i = 0; i < ECHO_CANCEL_LEN; i++)
+  {
+    echo_estimated += (g_audioout.history[(g_audioout.history_idx - i) & DAC_HISTORY_MASK] * (g_audioin.echo_cancel[i] / 1024) + 2048) / 4096;
+  }
+  
+  int blend = g_audioin.echo_cancel[ECHO_CANCEL_LEN - 1];
+  for (int i = ECHO_CANCEL_LEN; i < ECHO_CANCEL_LEN + 4; i++)
+  {
+    blend -= blend / 2;
+    echo_estimated += (g_audioout.history[(g_audioout.history_idx - i) & DAC_HISTORY_MASK] * (blend / 1024) + 2048) / 4096;
+  }
+  
+  int echo_delta = ac_value - echo_estimated;
+  for (int i = 0; i < ECHO_CANCEL_LEN; i++)
+  {
+    g_audioin.echo_cancel[i] += (echo_delta * g_audioout.history[(g_audioout.history_idx - i) & DAC_HISTORY_MASK] + 2048) / 4096;
+  }
+  
+  ac_value -= echo_estimated;
+  
+  // Perform click removal
+  int idx = g_audioin.click_remove_idx;
+  
+  if (g_audioin.click_remove[(idx + 6) & CLICK_REMOVE_MASK] > 3500 ||
+      g_audioin.click_remove[(idx + 6) & CLICK_REMOVE_MASK] < -3500)
+  {
+    int oldest = g_audioin.click_remove[(idx) & CLICK_REMOVE_MASK];
+    int newest = g_audioin.click_remove[(idx-1) & CLICK_REMOVE_MASK];
+    int delta = oldest - newest;
+    
+    if (oldest > -1000 && oldest < 1000 && newest > -1000 && newest < 1000 &&
+        delta < 1000 && delta > -1000)
+    {
+      int avg = (oldest + newest) / 2;
+      for (int i = 0; i < CLICK_REMOVE_LEN; i++)
+      {
+        g_audioin.click_remove[i] = avg;
+      }
+    }
+  }
+  
+  int click_filtered = g_audioin.click_remove[idx & CLICK_REMOVE_MASK];
+  g_audioin.click_remove[idx & CLICK_REMOVE_MASK] = ac_value;
+  g_audioin.click_remove_idx++;
+  
   // Compand using alaw algorithm and write to the packet buffer.
-  uint8_t companded = alaw_encode(ac_value + g_audioin.quant_acc);
-  g_audioin.quant_acc += ac_value - alaw_decode(companded);
+  int to_encode = click_filtered;
+  uint8_t companded = alaw_encode(to_encode + g_audioin.quant_acc);
+  g_audioin.quant_acc += to_encode - alaw_decode(companded);
   
   // Take new buffers from g_audioin.free_bufs
   if (!g_audioin.current_buf)
@@ -179,6 +246,9 @@ static inline IRAM void process_audio_out(portBASE_TYPE *task_awoken)
     }
   }
   
+  // Volume adjustment
+  dac_val = (dac_val * get_volume()) / 16;
+  
   // Clamp to range 0 to 8192.
   dac_val += 4096;
   if (dac_val < 0) dac_val = 0;
@@ -191,6 +261,9 @@ static inline IRAM void process_audio_out(portBASE_TYPE *task_awoken)
     sigma_delta_encode(g_audioout.dac_prev, dac_val, &I2S.TXFIFO, AUDIO_OUT_OVERSAMPLE, &g_audioout.error_acc);
     g_audioout.dac_prev = dac_val;
   }
+  
+  g_audioout.history_idx++;
+  g_audioout.history[g_audioout.history_idx & DAC_HISTORY_MASK] = dac_val - 4096;
   
   g_audioout.current_pos++;
   if (g_audioout.current_pos >= AUDIO_BLOCKSIZE)
@@ -296,14 +369,9 @@ void audio_task(void *pvParameters)
 {
   printf("Audio task starting\n");
   
-  while (sdk_wifi_station_get_connect_status() != STATION_GOT_IP) {
-    vTaskDelay(10);
-  }
-  
   audio_init();
   
   // GPIO12 is toggled for measuring IRQ processing length
-  gpio_enable(12, GPIO_OUTPUT);
   gpio_enable(13, GPIO_OUTPUT);
   
   // Enable interrupt handler at 12.5 kHz
@@ -401,6 +469,13 @@ void audio_task(void *pvParameters)
                g_audioout.current_pos, (int)uxQueueMessagesWaiting(g_peers[0].received_bufs), !!g_peers[0].current_buf,
               peer_count);
         
+        printf("filter = ");
+        for (int i = 0; i < ECHO_CANCEL_LEN; i++)
+        {
+          printf("%4d ", g_audioin.echo_cancel[i]);
+        }
+        printf("\n");
+        
 //         printf("%02x\n", REG);
 //         g_foo = REG;
         
@@ -409,8 +484,6 @@ void audio_task(void *pvParameters)
     }
   }
 }
-
-uint32_t sdk_readvdd33();
 
 void audio_task_start()
 {
